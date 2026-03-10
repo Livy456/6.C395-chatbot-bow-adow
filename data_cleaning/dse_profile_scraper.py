@@ -398,83 +398,93 @@ def scrape_general_page(org_code: str, row: dict) -> dict:
 
     # ── Summary stats: Enrollment / Grades Served / Student–Teacher Ratio ─
     #
-    # HTML structure (simplified):
+    # DESE HTML structure per stats cell:
     #   <td>School Type <hr/> Public</td>
     #   <td>Enrollment <hr/> 222</td>
     #   <td>Grades Served <hr/> PK - 06</td>
     #   <td>Student / Teacher Ratio <hr/> 7.1 to 1</td>
     #
-    # get_text(separator=" ") joins child nodes with a space, so <hr/> becomes
-    # a space gap → "Enrollment  222".  We normalise whitespace then check
-    # whether the cell starts with a known keyword and grab the remainder.
+    # Root cause of all previous failures:
+    #   BeautifulSoup get_text() silently drops <hr/> (void element = no text),
+    #   so label and value collapse into one string.  The stats cells are also
+    #   nested inside a sub-table, so find("hr", recursive=False) never fires.
+    #
+    # Fix: mutate a fresh copy of the page soup, replacing every <hr/> with
+    # the sentinel string "|||HR|||" BEFORE calling get_text().  Then split
+    # each <td>'s text on that sentinel → clean (label, value) pair regardless
+    # of nesting depth.
 
-    for td in soup.find_all("td"):
-        # Join with space so <hr/> becomes a whitespace gap, not nothing.
+    soup2 = BeautifulSoup(resp.text, "lxml")
+    for hr_tag in soup2.find_all("hr"):
+        hr_tag.replace_with("|||HR|||")
+
+    for td in soup2.find_all("td"):
         raw = td.get_text(separator=" ", strip=True)
-        # Collapse multiple spaces / tabs into one.
-        text = re.sub(r"\s+", " ", raw).strip()
-        text_lower = text.lower()
+        if "|||HR|||" not in raw:
+            continue
 
-        # --- School Type ---
-        if text_lower.startswith("school type") and not row.get("school_type"):
-            val = text[len("school type"):].strip().lstrip("-— ").strip()
-            if val:
-                row["school_type"] = val
+        # There should be exactly one sentinel per stat cell; take only the
+        # first split so accidental duplicates don't corrupt the value.
+        label_raw, _, value_raw = raw.partition("|||HR|||")
+        label = re.sub(r"\s+", " ", label_raw).strip().lower()
+        value = re.sub(r"\s+", " ", value_raw).strip()
 
-        # --- Enrollment ---
-        # Cell text: "Enrollment 222"  or  "2025-26 Enrollment 222"
-        elif "enrollment" in text_lower and not row.get("enrollment"):
-            m = re.search(r"\b(\d[\d,]*)\b", text)
+        if not label or not value:
+            continue
+
+        # Discard any cell whose value still contains "|||HR|||"
+        # (that means it's an outer wrapper td, not an inner stat cell).
+        if "|||HR|||" in value:
+            continue
+
+        if "school type" in label and not row.get("school_type"):
+            row["school_type"] = value
+
+        elif "enrollment" in label and "year" not in label and not row.get("enrollment"):
+            m = re.search(r"(\d[\d,]*)", value)
             if m:
                 row["enrollment"] = m.group(1).replace(",", "")
 
-        # --- Grades Served ---
-        elif text_lower.startswith("grades served") and not row.get("grades_served"):
-            val = text[len("grades served"):].strip().lstrip("-— ").strip()
-            if val:
-                row["grades_served"] = val
+        elif "grades served" in label and not row.get("grades_served"):
+            row["grades_served"] = value
 
-        # --- Student / Teacher Ratio ---
-        elif (
-            "student" in text_lower
-            and "teacher" in text_lower
-            and "ratio" in text_lower
-            and not row.get("student_teacher_ratio")
-        ):
-            m = re.search(r"(\d+\.?\d*\s*to\s*1)", text, re.IGNORECASE)
-            if m:
-                row["student_teacher_ratio"] = m.group(1).strip()
+        elif "student" in label and "teacher" in label and "ratio" in label \
+                and not row.get("student_teacher_ratio"):
+            row["student_teacher_ratio"] = value
 
-    # ── Final safety net: scan full page text with multiline regex ─────────
-    # Catches any layout variant where stats are not in their own <td>.
+    # ── Safety net: line-by-line scan ────────────────────────────────────
+    # get_text(separator="\n") puts each text node on its own line.
+    # With <hr/> gone the layout is: "Enrollment\n222\nGrades Served\nPK - 06"
+    # so the value is always on the line immediately following its label.
+
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+    def _after_label(lines, keyword):
+        kw = keyword.lower()
+        for i, ln in enumerate(lines):
+            if kw in ln.lower() and i + 1 < len(lines):
+                return lines[i + 1]
+        return None
+
     if not row.get("enrollment"):
-        m = re.search(r"Enrollment[^0-9]{0,30}?(\d[\d,]+)", full_text, re.DOTALL)
-        if m:
-            row["enrollment"] = m.group(1).replace(",", "").strip()
+        nxt = _after_label(lines, "Enrollment")
+        if nxt and re.match(r"^\d[\d,]*$", nxt):
+            row["enrollment"] = nxt.replace(",", "")
 
     if not row.get("grades_served"):
-        m = re.search(
-            r"Grades\s+Served[^A-Za-z0-9]{0,20}([A-Z0-9][^\n]{1,30})",
-            full_text, re.DOTALL
-        )
-        if m:
-            row["grades_served"] = m.group(1).strip()
+        nxt = _after_label(lines, "Grades Served")
+        if nxt and re.search(r"[A-Z0-9]", nxt):
+            row["grades_served"] = nxt
 
     if not row.get("student_teacher_ratio"):
-        m = re.search(
-            r"Student\s*/\s*Teacher\s+Ratio[^0-9]{0,30}?(\d+\.?\d*\s*to\s*1)",
-            full_text, re.DOTALL | re.IGNORECASE
-        )
-        if m:
-            row["student_teacher_ratio"] = m.group(1).strip()
+        nxt = _after_label(lines, "Student / Teacher Ratio")
+        if nxt and re.search(r"\d", nxt):
+            row["student_teacher_ratio"] = nxt
 
     if not row.get("school_type"):
-        m = re.search(
-            r"School\s+Type[^A-Za-z]{0,20}([A-Za-z][^\n]{1,30})",
-            full_text, re.DOTALL
-        )
-        if m:
-            row["school_type"] = m.group(1).strip()
+        nxt = _after_label(lines, "School Type")
+        if nxt:
+            row["school_type"] = nxt
 
     return row
 
